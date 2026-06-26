@@ -216,4 +216,4 @@ This tool is for **authorized security testing only**. You are responsible for e
 
 ---
 
-*"I am not in danger. I am the danger."* — Built this from scratch instead of buying it.
+*"I am not in danger. I am the danger."* — Waltuh
