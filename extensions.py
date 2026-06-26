@@ -857,7 +857,7 @@ def register_extensions(app):
                     'font-size:0.8rem;line-height:1.6">'+text+'</div>')
         def code(text):
             return '<code style="background:var(--bg);padding:2px 6px;border-radius:4px;font-size:0.8rem">'+text+'</code>'
-        qs  = step(1,'Connect to Pi at <strong>10.42.0.42</strong>, dashboard on port 8080')
+        qs  = step(1,'Connect to Pi at <strong>0.0.0.0</strong>, dashboard on port 8080')
         qs += step(2,'Login: user <strong>admin</strong> / pass <strong>pinapple</strong>')
         qs += step(3,'<strong>AP Control</strong> &mdash; set SSID, start rogue AP on wlan0')
         qs += step(4,'<strong>Settings</strong> &mdash; choose portal type, enable DNS hijack')
