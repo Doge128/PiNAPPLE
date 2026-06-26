@@ -8,7 +8,8 @@ LOG_FILE = '/var/log/pinapple/creds.log'
 def get_client_mac(ip):
     try:
         with open('/proc/net/arp') as f:
-            for line in f.readlines()[1:]:
+            next(f)
+            for line in f:
                 parts = line.split()
                 if len(parts) >= 4 and parts[0] == ip:
                     return parts[3]

@@ -18,12 +18,14 @@ _pmkid_proc   = [None]
 def sysinfo():
     info = {}
     try:
-        r = subprocess.run(['top','-bn1'], capture_output=True, text=True)
-        for line in r.stdout.splitlines():
-            if 'Cpu' in line:
-                m = re.search(r'([\d.]+)\s*id', line)
-                if m: info['cpu'] = round(100 - float(m.group(1)), 1)
-                break
+        def _stat():
+            f = [int(x) for x in open('/proc/stat').readline().split()[1:]]
+            return f[3], sum(f)
+        idle1, total1 = _stat()
+        time.sleep(0.1)
+        idle2, total2 = _stat()
+        dt = total2 - total1
+        info['cpu'] = round((1 - (idle2 - idle1) / dt) * 100, 1) if dt else 0
     except: info['cpu'] = 0
     try:
         mem = {}
@@ -47,25 +49,20 @@ def sysinfo():
     except: info['temp'] = 0
     return info
 
-def load_ssid_pool():
-    try:
-        with open(SSID_POOL) as f:
-            return [l.strip() for l in f if l.strip() and not l.startswith('#')]
-    except: return []
-
-def save_ssid_pool(ssids):
-    os.makedirs('/etc/pinapple', exist_ok=True)
-    with open(SSID_POOL, 'w') as f: f.write('\n'.join(ssids))
-
-def load_filter_list(path):
+def load_lines(path):
     try:
         with open(path) as f:
             return [l.strip() for l in f if l.strip() and not l.startswith('#')]
     except: return []
 
-def save_filter_list(path, entries):
+def save_lines(path, entries):
     os.makedirs('/etc/pinapple', exist_ok=True)
     with open(path, 'w') as f: f.write('\n'.join(entries))
+
+load_filter_list  = load_lines
+save_filter_list  = save_lines
+def load_ssid_pool(): return load_lines(SSID_POOL)
+def save_ssid_pool(s): save_lines(SSID_POOL, s)
 
 def load_pineap_cfg():
     d = {'mode':'passive','beacon_response':False,'log_probes':True,'auto_add_to_pool':False}

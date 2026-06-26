@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """PiNAPPLE Dashboard - WiFi Auditing Platform"""
-import os, json, subprocess, csv, io, datetime, glob
+import os, json, re, subprocess, csv, io, datetime, glob, threading, uuid
 from functools import wraps
 from flask import Flask, request, jsonify, redirect, Response
 from werkzeug.security import check_password_hash, generate_password_hash
+from ext_helpers import _kill_proc, _proc_running
 
 app = Flask(__name__)
+
+_cfg_cache = None
 
 CONFIG_FILE = '/etc/pinapple/config.json'
 CREDS_LOG = '/var/log/pinapple/creds.log'
@@ -19,6 +22,9 @@ FLAG_PORTAL = '/etc/pinapple/portal_redirect_enabled'
 ACTIVE_PORTAL = '/opt/pinapple/portal/index.html'
 
 def load_config():
+    global _cfg_cache
+    if _cfg_cache:
+        return _cfg_cache
     defaults = {
         'username': 'admin',
         'password_hash': generate_password_hash('pinapple'),
@@ -31,14 +37,18 @@ def load_config():
             for k, v in defaults.items():
                 if k not in cfg:
                     cfg[k] = v
+            _cfg_cache = cfg
             return cfg
     except:
+        _cfg_cache = defaults
         return defaults
 
 def save_config(cfg):
+    global _cfg_cache
     os.makedirs('/etc/pinapple', exist_ok=True)
     with open(CONFIG_FILE, 'w') as f:
         json.dump(cfg, f, indent=2)
+    _cfg_cache = cfg
 
 def require_auth(f):
     @wraps(f)
@@ -109,12 +119,12 @@ def read_hostapd_conf():
         pass
     return cfg
 
-def write_hostapd_conf(ssid, channel, mode, txpower):
+def write_hostapd_conf(ssid, channel, mode):
     pwd_line = ''
     if mode == 'wpa2':
         pwd_line = '\nwpa=2\nwpa_passphrase=pinapple123\nwpa_key_mgmt=WPA-PSK\nrsn_pairwise=CCMP'
     conf = "interface=wlan0\ndriver=nl80211\nssid={}\nhw_mode=g\nchannel={}\nieee80211n=1\n".format(ssid, channel)
-    conf += "ht_capab=[HT40+][HT40-][SHORT-GI-20][SHORT-GI-40][DSSS_CCK-40]\nwmm_enabled=1\nauth_algs=1\nignore_broadcast_ssid=0"
+    conf += "ht_capab=[SHORT-GI-20][DSSS_CCK-40]\nwmm_enabled=1\nauth_algs=1\nignore_broadcast_ssid=0"
     conf += pwd_line + "\n"
     with open(HOSTAPD_CONF, 'w') as f:
         f.write(conf)
@@ -248,8 +258,8 @@ def overview():
     p_on = os.path.exists(FLAG_PORTAL)
     uptime = subprocess.run(['uptime','-p'], capture_output=True, text=True).stdout.strip()
     ssid = read_hostapd_conf().get('ssid','PiNAPPLE')
-    eth_ip = subprocess.run("ip addr show eth0|grep 'inet '|awk '{print $2}'|cut -d/ -f1",
-                           shell=True, capture_output=True, text=True).stdout.strip()
+    r = subprocess.run(['ip','addr','show','eth0'], capture_output=True, text=True)
+    eth_ip = next((l.split()[1].split('/')[0] for l in r.stdout.splitlines() if 'inet ' in l), 'N/A')
 
     def sdot(ok): return '<span class="sdot {}"></span>'.format('on' if ok else 'off')
     def stxt(ok): return '<span style="color:var(--{})">&#9679; {}</span>'.format(
@@ -485,7 +495,7 @@ def ap_control():
             channel = int(request.form.get('channel',6))
             mode = request.form.get('mode','open')
             txpower = request.form.get('txpower','medium')
-            write_hostapd_conf(ssid, channel, mode, txpower)
+            write_hostapd_conf(ssid, channel, mode)
             subprocess.run(['systemctl','restart','pinapple-ap'])
             msg = '<span style="color:var(--grn)">Config updated and AP restarted.</span>'
 
@@ -647,7 +657,6 @@ def settings_page():
 # ============================================================
 # WLAN1 ATTACK FEATURES
 # ============================================================
-import uuid, glob as _glob, signal as _signal
 
 PROBES_LOG   = '/var/log/pinapple/probes.json'
 TRACKER_LOG  = '/var/log/pinapple/clients_seen.json'
@@ -742,7 +751,6 @@ def api_handshake_start():
         except Exception as e:
             _hs_jobs[job_id] = {'status': 'error', 'output': str(e), 'pcap': None}
 
-    import threading
     threading.Thread(target=run, daemon=True).start()
     return jsonify({'ok': True, 'job_id': job_id})
 
@@ -778,50 +786,23 @@ def api_beacon_start():
 @app.route('/api/wlan1/beacon-flood/stop', methods=['POST'])
 @require_auth
 def api_beacon_stop():
-    stopped = False
-    if _beacon_proc[0] and _beacon_proc[0].poll() is None:
-        _beacon_proc[0].terminate()
-        stopped = True
-    try:
-        with open(BEACON_PID) as f:
-            pid = int(f.read().strip())
-        os.kill(pid, 15)
-        stopped = True
-    except:
-        pass
-    try: os.remove(BEACON_PID)
-    except: pass
-    return jsonify({'ok': True, 'stopped': stopped})
+    _kill_proc(_beacon_proc, BEACON_PID)
+    return jsonify({'ok': True, 'stopped': True})
 
 @app.route('/api/wlan1/beacon-flood/status')
 @require_auth
 def api_beacon_status():
-    running = False
-    pid = None
-    if _beacon_proc[0] and _beacon_proc[0].poll() is None:
-        running = True
-        pid = _beacon_proc[0].pid
-    else:
-        try:
-            with open(BEACON_PID) as f:
-                pid = int(f.read().strip())
-            os.kill(pid, 0)
-            running = True
-        except:
-            pass
+    running, pid = _proc_running(_beacon_proc, BEACON_PID)
     ssids = []
     try:
         with open(BEACON_SSIDS) as f:
             ssids = [l.strip() for l in f if l.strip()]
-    except:
-        pass
+    except: pass
     return jsonify({'running': running, 'pid': pid, 'ssids': ssids})
 
 @app.route('/api/wlan1/pcap/<filename>')
 @require_auth
 def api_pcap_download(filename):
-    # Security: only allow hs_*.pcap filenames
-    import re
     if not re.match(r'^hs_[a-f0-9]{8}\.pcap$', filename):
         return Response('Invalid filename', 403)
     fpath = os.path.join(PCAP_DIR, filename)
