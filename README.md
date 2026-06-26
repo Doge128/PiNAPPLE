@@ -213,7 +213,6 @@ This tool is for **authorized security testing only**. You are responsible for e
 ## Author
 
 **[@Hackshiz](https://github.com/Doge128)** — cybersec learner, Computer Geek, Outdoor Enthusiest
-Built as part of [Hack Club Stardance 2026](https://stardance.hackclub.com) 🚀
 
 ---
 
