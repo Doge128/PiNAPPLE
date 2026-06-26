@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hotel WiFi — Guest Login</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: Georgia, 'Times New Roman', serif;
+         background: #1a0a00; min-height: 100vh;
+         display: flex; align-items: center; justify-content: center; }
+  .card { background: #fff8f0; border-radius: 4px; padding: 48px;
+          width: 100%; max-width: 440px; border-top: 6px solid #8b6914; }
+  h1 { text-align: center; font-size: 1.8rem; color: #1a0a00; margin-bottom: 4px;
+       letter-spacing: 2px; text-transform: uppercase; }
+  .subtitle { text-align: center; color: #8b6914; font-style: italic;
+              margin-bottom: 32px; font-size: 0.95rem; }
+  .field { margin-bottom: 20px; }
+  label { display: block; font-size: 0.8rem; color: #666; margin-bottom: 6px;
+          text-transform: uppercase; letter-spacing: 1px; }
+  input { width: 100%; padding: 12px; border: 1px solid #d4b483;
+          background: white; font-size: 1rem; font-family: Georgia, serif; outline: none; }
+  input:focus { border-color: #8b6914; }
+  button { width: 100%; padding: 14px; background: #8b6914; color: white;
+           border: none; font-size: 0.9rem; letter-spacing: 2px;
+           text-transform: uppercase; cursor: pointer; font-family: Georgia, serif; }
+  .footer { text-align: center; margin-top: 24px; font-size: 0.75rem; color: #999; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Grand Hotel</h1>
+  <p class="subtitle">Complimentary Guest Internet Access</p>
+  <form method="POST" action="/portal/submit">
+    <input type="hidden" name="portal_type" value="hotel">
+    <div class="field">
+      <label for="room">Room Number</label>
+      <input type="text" id="room" name="room_number" placeholder="e.g. 412" required>
+    </div>
+    <div class="field">
+      <label for="lastname">Last Name</label>
+      <input type="text" id="lastname" name="last_name" placeholder="As registered at check-in" required>
+    </div>
+    <button type="submit">Access Internet</button>
+  </form>
+  <div class="footer">Complimentary WiFi - Available 24/7 - Support: Dial 0</div>
+</div>
+</body>
+</html>

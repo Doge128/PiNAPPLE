@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Welcome - Accept Terms</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+         background: #f5f5f5; min-height: 100vh;
+         display: flex; align-items: center; justify-content: center; }
+  .card { background: white; border-radius: 12px; padding: 40px;
+          width: 100%; max-width: 420px; box-shadow: 0 4px 24px rgba(0,0,0,0.1); }
+  .icon { text-align: center; font-size: 3rem; margin-bottom: 16px; }
+  h1 { text-align: center; font-size: 1.5rem; color: #1a1a2e; margin-bottom: 12px; }
+  .terms { background: #f8f8f8; border-radius: 8px; padding: 16px;
+           font-size: 0.8rem; color: #666; line-height: 1.6; margin-bottom: 24px;
+           max-height: 150px; overflow-y: auto; }
+  button { width: 100%; padding: 16px; background: #00b894; color: white;
+           border: none; border-radius: 8px; font-size: 1.1rem;
+           font-weight: 600; cursor: pointer; }
+  .footer { text-align: center; margin-top: 16px; font-size: 0.75rem; color: #bbb; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="icon">&#128246;</div>
+  <h1>Free Internet Access</h1>
+  <div class="terms">
+    <strong>Terms of Use</strong><br><br>
+    By clicking Accept and Connect you agree to use this network responsibly and
+    in compliance with all applicable laws. Unlawful use, hacking, or abuse of this
+    network is strictly prohibited. Your session may be monitored for security purposes.
+  </div>
+  <form method="POST" action="/portal/submit">
+    <input type="hidden" name="portal_type" value="splash">
+    <button type="submit">Accept and Connect</button>
+  </form>
+  <div class="footer">Powered by Free WiFi Network</div>
+</div>
+</body>
+</html>
